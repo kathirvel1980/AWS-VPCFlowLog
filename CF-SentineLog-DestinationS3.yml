@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Sentinel Firehose + CloudWatch Logs Destination StackSet.
+  Deploy this in the Sentinel (audit) account across target regions.
+
+Parameters:
+  StackSetName:
+    Type: String
+    Description: Short name for resources (used in names)
+  S3BucketAllEvents:
+    Type: String
+    Description: S3 bucket name 
+  S3Prefix:
+    Type: String
+    Description: S3 prefix 
+    Default: "VPCFlowLog"
+  OrgId:
+    Type: String
+    Description: Organization ID (o-xxxxxxxxxx)
+    MinLength: 12
+    MaxLength: 12
+    AllowedPattern: '^o-[a-z0-9]{10}$'
+  SentinelDestinationName:
+    Type: String
+    Description: CloudWatch Logs Destination name (per-region)
+    Default: SentinelFlowLogsToFirehose
+  FirehoseDeliveryStreamNamePrefix:
+    Type: String
+    Description: Prefix for firehose delivery stream names
+    Default: Sentinel-vpc
+
+Resources:
+
+  ########################################
+  # Firehose Role (writes to S3)
+  ########################################
+  SentinelFirehoseStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${FirehoseDeliveryStreamNamePrefix}-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Sub "${FirehoseDeliveryStreamNamePrefix}-s3policy-${AWS::Region}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowS3Write
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketAllEvents}
+                  - !Sub arn:aws:s3:::${S3BucketAllEvents}/*
+      Tags:
+        - Key: Project
+          Value: Sentinel
+          
+  ########################################
+  # Firehose Delivery Stream (Extended S3)
+  ########################################
+  FirehoseLogsDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - SentinelFirehoseStreamRole
+    Properties:
+      DeliveryStreamName: !Sub "${FirehoseDeliveryStreamNamePrefix}-${AWS::Region}"
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub arn:aws:s3:::${S3BucketAllEvents}
+        RoleARN: !GetAtt SentinelFirehoseStreamRole.Arn
+        Prefix: !Ref S3Prefix
+        ErrorOutputPrefix: !Sub "${S3Prefix}error/"
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 128
+        CompressionFormat: GZIP
+        EncryptionConfiguration:
+          NoEncryptionConfig: NoEncryption
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub "/aws/kinesisfirehose/${StackSetName}"
+          LogStreamName: !Sub "FirehoseDelivery-${AWS::Region}"
+      Tags:
+        - Key: Project
+          Value: Sentinel
+          
+  ########################################
+  # Role that CloudWatch Logs will assume to put into Firehose
+  ########################################
+  CWSentinelToFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CWLogstoFirehoseRole-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Sub "CWLogstoFirehoseRole-${AWS::Region}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowFirehoseReadsAndPut
+                Effect: Allow
+                Action:
+                  - firehose:DescribeDeliveryStream
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt FirehoseLogsDeliveryStream.Arn
+      Tags:
+        - Key: Project
+          Value: Sentinel
+          
+  ########################################
+  # Destination Policy JSON doc is generated here
+  ########################################
+  CloudWatchLogsDestination:
+    Type: AWS::Logs::Destination
+    DependsOn:
+      - FirehoseLogsDeliveryStream
+      - CWSentinelToFirehoseRole
+    Properties:
+      DestinationName: !Ref SentinelDestinationName
+      TargetArn: !GetAtt FirehoseLogsDeliveryStream.Arn
+      RoleArn: !GetAtt CWSentinelToFirehoseRole.Arn
+      DestinationPolicy: !Sub |
+        {
+          "Version":"2012-10-17",
+          "Statement":[
+            {
+              "Sid":"AllowOrgPutSubscriptionFilter",
+              "Effect":"Allow",
+              "Principal":"*",
+              "Action":"logs:PutSubscriptionFilter",
+              "Resource":"arn:aws:logs:${AWS::Region}:${AWS::AccountId}:destination:${SentinelDestinationName}",
+              "Condition":{
+                "StringEquals":{"aws:PrincipalOrgID":"${OrgId}"}
+              }
+            }
+          ]
+        }
+
+Outputs:
+  FirehoseDeliveryStreamName:
+    Description: Firehose delivery stream name for this region
+    Value: !Ref FirehoseLogsDeliveryStream
+
+  FirehoseDeliveryStreamArn:
+    Description: Firehose delivery stream ARN
+    Value: !GetAtt FirehoseLogsDeliveryStream.Arn
+
+  CloudWatchDestinationArn:
+    Description: CloudWatch Destination ARN (use this in member accounts for PutSubscriptionFilter)
+    Value: !GetAtt CloudWatchLogsDestination.Arn

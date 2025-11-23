@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Tooling Account - Sentinel VPC Flow Log Attacher.
+  Updated: Creates custom EventBus 'sentinel', adds Org permission,
+  discovery trigger, CreateVpc trigger, and manual trigger.
+
+Parameters:
+  LambdaNamePrefix:
+    Type: String
+    Default: SentinelVPCflow
+  PrincipalOrgID:
+    Type: String
+    Default: o-qja1agnepv
+
+Resources:
+
+  SentinelEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: sentinel
+      Tags:
+        - Key: Project
+          Value: Sentinel
+
+  SentinelEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    DependsOn: SentinelEventBus
+    Properties:
+      StatementId: AllowOrgPutEvents
+      EventBusName: sentinel
+      Action: events:PutEvents
+      Principal: "*"
+      Condition:
+        Type: StringEquals
+        Key: aws:PrincipalOrgID
+        Value: !Ref PrincipalOrgID
+
+  ToolingFlowLogLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "Tooling-FlowLogLambdaRole-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AssumeMemberRoles
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: Sentinel
+
+  SentinelVPCFlowLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${LambdaNamePrefix}-${AWS::Region}"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt ToolingFlowLogLambdaRole.Arn
+      Code:
+        ZipFile: |
+          # (Lambda code unchanged for brevity)
+          import boto3, json
+          def lambda_handler(event, context):
+              print("Tooling Lambda Event:", json.dumps(event))
+              if event.get("source") == "sentinel.vpc.discovery":
+                  return run_discovery(event)
+              return run_create_vpc(event)
+          def assume(member, region):
+              arn = f"arn:aws:iam::{member}:role/Sentinel-FlowLog-Manager-{region}"
+              sts = boto3.client("sts")
+              creds = sts.assume_role(RoleArn=arn, RoleSessionName="SentinelSession")["Credentials"]
+              return boto3.client(
+                  "ec2",
+                  region_name=region,
+                  aws_access_key_id=creds["AccessKeyId"],
+                  aws_secret_access_key=creds["SecretAccessKey"],
+                  aws_session_token=creds["SessionToken"],
+              )
+          def attach(ec2, vpc_id, region, member):
+              try:
+                  role = f"arn:aws:iam::{member}:role/Sentinel-FlowLog-role-{region}"
+                  resp = ec2.create_flow_logs(
+                      ResourceIds=[vpc_id],
+                      ResourceType="VPC",
+                      TrafficType="ALL",
+                      LogGroupName="Sentinel-VPCFlowLog-All",
+                      DeliverLogsPermissionArn=role,
+                      LogDestinationType="cloud-watch-logs",
+                      MaxAggregationInterval=60,
+                      LogFormat='${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action}'                      
+                  )
+                  fl_ids = resp.get("FlowLogIds", [])
+                  if fl_ids:
+                      ec2.create_tags(Resources=fl_ids, Tags=[{"Key": "Project", "Value": "Sentinel"}])
+                  print("Created flow log for", vpc_id, fl_ids)
+              except Exception as e:
+                  print("ERROR creating flow log:", e)
+          def run_create_vpc(event):
+              d = event.get("detail", {})
+              region = event.get("region")
+              member = d.get("userIdentity", {}).get("accountId")
+              vpc_id = d.get("responseElements", {}).get("vpc", {}).get("vpcId")
+              if not (member and vpc_id and region):
+                  print("Missing fields", event)
+                  return
+              ec2 = assume(member, region)
+              attach(ec2, vpc_id, region, member)
+          def run_discovery(event):
+              region = event.get("region") or (event.get("detail") or {}).get("region")
+              member = event.get("account") or (event.get("detail") or {}).get("account")
+              if not (member and region):
+                  print("Missing discovery fields")
+                  return
+              ec2 = assume(member, region)
+              vpcs = ec2.describe_vpcs().get("Vpcs", [])
+              for v in vpcs:
+                  vid = v["VpcId"]
+                  logs = ec2.describe_flow_logs(Filters=[{"Name": "resource-id", "Values": [vid]}]).get("FlowLogs", [])
+                  tagged = any(any(t.get("Key") == "Project" and t.get("Value") == "Sentinel" for t in fl.get("Tags", [])) for fl in logs)
+                  if tagged:
+                      continue
+                  attach(ec2, vid, region, member)
+      Tags:
+        - Key: Project
+          Value: Sentinel
+
+  EventInvokeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "Sentinel-InvokeLambdaRole-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowInvokeSentinelLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt SentinelVPCFlowLambda.Arn
+      Tags:
+        - Key: Project
+          Value: Sentinel
+
+  SentinelDiscoveryRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: sentinel
+      Description: "Triggers Lambda on discovery events"
+      EventPattern:
+        source:
+          - sentinel.vpc.discovery
+      Targets:
+        - Id: Discovery
+          Arn: !GetAtt SentinelVPCFlowLambda.Arn
+          RoleArn: !GetAtt EventInvokeLambdaRole.Arn
+      Tags:
+        - Key: Project
+          Value: Sentinel
+
+  SentinelCreateVpcRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: sentinel
+      Description: "Triggers Lambda on CreateVpc CloudTrail events"
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - CreateVpc
+      Targets:
+        - Id: CreateVpc
+          Arn: !GetAtt SentinelVPCFlowLambda.Arn
+          RoleArn: !GetAtt EventInvokeLambdaRole.Arn
+      Tags:
+        - Key: Project
+          Value: Sentinel
+
+  ManualTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: sentinel
+      Description: "Manual trigger for forcing discovery"
+      EventPattern:
+        source:
+          - sentinel.manual.trigger
+      Targets:
+        - Id: Manual
+          Arn: !GetAtt SentinelVPCFlowLambda.Arn
+          RoleArn: !GetAtt EventInvokeLambdaRole.Arn
+      Tags:
+        - Key: Project
+          Value: Sentinel
+
+Outputs:
+  SentinelBusArn:
+    Value: !GetAtt SentinelEventBus.Arn
+  LambdaArn:
+    Value: !GetAtt SentinelVPCFlowLambda.Arn
+  DiscoveryRuleArn:
+    Value: !GetAtt SentinelDiscoveryRule.Arn
