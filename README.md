@@ -1,545 +1,183 @@
-AWS Member Accounts (17 regions)
-       │ VPC Create + Discovery Events
-       ▼
-EventBridge → Tooling Account
-       │
-       ▼
-Lambda (Sentinel VPC FlowLog Attacher)
-       │
-Assume Role (FlowLog Manager) in all Member Accounts
-       │
-Create / Verify / Tag Flow Logs (CloudWatch LogGroup)
-       │
-SubscriptionFilter → CloudWatch Logs Destination (in Audit Account)
-       │
-Firehose (per region)
-       │
-S3 Central Bucket  → (ObjectCreated event)
-       │
-SQS Queue
-       │
-Microsoft Sentinel (Data Connector)
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sentinel VPC Flow Logs — SOP & Templates</title>
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--accent:#0ea5a1;--muted:#94a3b8;--mono:Menlo,Monaco,Consolas,monospace}
+    body{font-family:Inter,system-ui,Arial,sans-serif;background:linear-gradient(180deg,#071028 0%,#08142a 100%);color:#e6eef8;margin:0;padding:32px}
+    .container{max-width:1100px;margin:0 auto}
+    header{display:flex;align-items:center;gap:16px;margin-bottom:18px}
+    h1{margin:0;font-size:20px}
+    .meta{color:var(--muted);font-size:13px}
+    section.card{background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));padding:18px;border-radius:12px;margin-bottom:14px;box-shadow:0 6px 18px rgba(2,6,23,0.6)}
+    .grid{display:grid;grid-template-columns:1fr 360px;gap:16px}
+    pre{background:#061226;padding:12px;border-radius:8px;overflow:auto;color:#dbeafe;font-family:var(--mono);font-size:12px}
+    code{font-family:var(--mono);font-size:13px}
+    .pill{display:inline-block;background:rgba(255,255,255,0.03);padding:6px 10px;border-radius:999px;font-size:12px;color:var(--muted)}
+    .small{font-size:13px;color:var(--muted)}
+    summary{cursor:pointer;font-weight:600}
+    details{margin-bottom:8px}
+    .mermaid{background:#000;padding:8px;border-radius:6px}
+    .download{display:inline-block;padding:8px 12px;background:var(--accent);color:#042024;border-radius:8px;text-decoration:none;font-weight:700}
+  </style>
+  <!-- Mermaid CDN (works when connected to internet) -->
+  <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({startOnLoad:true,theme:'base',securityLevel:'loose'});</script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div>
+        <h1>Sentinel VPC Flow Log — SOP, Templates & Runbook</h1>
+        <div class="meta">Author: Automation / Architect | Format: GitUpload-ready single HTML</div>
+      </div>
+      <div style="margin-left:auto;text-align:right">
+        <div class="pill">Centralized VPC Flow Logs • 17 regions</div>
+      </div>
+    </header>
 
+    <section class="card">
+      <h2>Summary</h2>
+      <p class="small">This document provides a deployable, operational SOP for collecting VPC Flow Logs centrally across AWS Organization member accounts. It contains: architecture diagram (Mermaid), high-level workflow, CloudFormation templates for Tooling/Member/Audit stacks, deployment steps, validation checks, runbooks, troubleshooting, and example automation scripts.</p>
+    </section>
 
+    <div class="grid">
+      <main>
+        <section class="card">
+          <h2>Architecture Diagram</h2>
+          <div class="mermaid">
+            %%{init: {"theme":"neutral"}}%%
+            flowchart LR
+              subgraph MemberAccount[Member Account]
+                A[VPC]
+                B[CloudWatch Log Group\nSentinel-VPCFlowLog-All]
+                C[FlowLog Role\nSentinel-FlowLog-role-<region>]
+                A -->|Flow Logs -> CW Logs| B
+                B -->|SubscriptionFilter ->| D[CW Logs Destination (Audit account)]
+                B -->|EventRule: sentinel.vpc.discovery| E[EventBridge -> sentinel bus (Tooling)]
+              end
 
-Sentinel VPC Flow Log — SOP, CloudFormation Templates, and Architecture Diagram
-Purpose: Provide a complete, deployable Standard Operating Procedure (SOP) for centralized VPC Flow Log collection using: member stacks, tooling (central) stack, and audit (firehose + S3) stack. Includes ready-to-paste CloudFormation templates (tooling, member, audit), an architecture diagram (Mermaid), deployment steps, validation checks, operational runbooks, and troubleshooting.
-________________________________________
-1. Architecture Diagram (Mermaid)
-flowchart LR
-  subgraph MemberAccount[Member Account]
-    A[VPC]
-    B[CloudWatch Log Group \n Sentinel-VPCFlowLog-All]
-    C[FlowLog Role \n Sentinel-FlowLog-role-<region>]
-    A -->|Flow Logs -> CW Logs| B
-    B -->|SubscriptionFilter ->| D[CW Logs Destination (Audit account)]
-    B -->|EventRule: sentinel.vpc.discovery| E[EventBridge -> sentinel bus (Tooling)]
-  end
+              subgraph AuditAccount[Audit (Log Destination)]
+                D --> F[CloudWatch Logs Destination]
+                F --> G[Firehose Delivery Stream]
+                G --> H[S3 Bucket (us-east-1)]
+                H --> I[SQS Queue]
+              end
 
-  subgraph AuditAccount[Audit (Log Destination)]
-    D --> F[CloudWatch Logs Destination]
-    F --> G[Firehose Delivery Stream]
-    G --> H[S3 Bucket (us-east-1)]
-    H --> I[SQS Queue]
-  end
+              subgraph ToolingAccount[Tooling]
+                E --> J[Tooling EventBus: sentinel]
+                J --> K[SentinelVPCFlowLambda]
+                K -->|AssumeRole| L[Member: Sentinel-FlowLog-Manager-<region>]
+                K -->|create_flow_logs| B
+              end
 
-  subgraph ToolingAccount[Tooling]
-    E --> J[Tooling EventBus: sentinel]
-    J --> K[SentinelVPCFlowLambda]
-    K -->|AssumeRole| L[Member: Sentinel-FlowLog-Manager-<region>]
-    K -->|create_flow_logs| B
-  end
+              I --> M[Azure Sentinel Connector]
+          </div>
+        </section>
 
-  I --> M[Azure Sentinel Connector]
-________________________________________
-2. High-level Workflow
-1.	Members create a CloudWatch Log Group Sentinel-VPCFlowLog-All (member CFT). They also create roles:
-o	Sentinel-FlowLog-role-<region> (DeliverLogsPermissionArn used by Flow Logs)
-o	Sentinel-FlowLog-Manager-<region> (assumable by tooling account to create flow logs)
-2.	Member stack optionally invokes a Custom Resource that sends a sentinel.vpc.discovery event to the Tooling EventBus to request discovery at stack creation time.
-3.	Tooling account hosts an EventBridge sentinel EventBus and SentinelVPCFlowLambda.
-o	The Lambda receives discovery events or CloudTrail CreateVpc events forwarded to the sentinel bus.
-o	The Lambda assumes each member’s Sentinel-FlowLog-Manager-<region> role and calls CreateFlowLogs with a LogFormat that excludes ${flow-log-status} to avoid NODATA.
-4.	Flow logs are delivered to CloudWatch Logs in each member account; a subscription filter forwards logs (excluding NODATA via FilterPattern: - "NODATA") to an Audit CloudWatch Logs Destination.
-5.	Audit account CloudWatch Logs Destination writes to a Firehose delivery stream (one region may act as central). Firehose writes compressed .gz files into a central S3 bucket (e.g. us-east-1) under a stable prefix: VPCflowLog/!{timestamp:yyyy}/....
-6.	S3 Event Notifications (prefix VPCflowLog/ + suffix .gz) publish s3:ObjectCreated:* events to an SQS queue.
-7.	Microsoft Sentinel connector assumes the cross-account role you created and polls SQS to read object keys, GetObject from S3 (reads .gz) and decompresses internally.
-________________________________________
-3. Tooling Account - CloudFormation (YAML)
-Purpose: creates sentinel EventBus, EventBusPolicy (org allow), Lambda (Tooling), Event Rules for discovery/createVpc/manual, and invocation roles.
-AWSTemplateFormatVersion: '2010-09-09'
-Description: Tooling Account - Sentinel VPC Flow Log Attacher
-Parameters:
-  LambdaNamePrefix:
-    Type: String
-    Default: SentinelVPCflow
-  PrincipalOrgID:
-    Type: String
-    Default: o-xxxxxxxxxx
+        <section class="card">
+          <h2>High-level Workflow (condensed)</h2>
+          <ol>
+            <li>Member stacks create CloudWatch Log Group <code>Sentinel-VPCFlowLog-All</code>, DeliverLogs role, and Manager assume-role for tooling.</li>
+            <li>Member stack optionally emits a discovery event into the tooling EventBus on creation.</li>
+            <li>Tooling Lambda assumes each member's Manager role and calls <code>CreateFlowLogs</code> with a LogFormat that excludes <code>${flow-log-status}</code>.</li>
+            <li>SubscriptionFilter (FilterPattern: <code>- "NODATA"</code>) forwards to Audit CloudWatch Logs Destination.</li>
+            <li>Audit CloudWatch Logs Destination → Firehose → S3 (prefix <code>VPCflowLog/</code>) → SQS notifications → Sentinel connector pulls and ingests.</li>
+          </ol>
+        </section>
 
-Resources:
-  SentinelEventBus:
-    Type: AWS::Events::EventBus
-    Properties:
-      Name: sentinel
-      Tags:
-        - Key: Project
-          Value: Sentinel
+        <section class="card">
+          <h2>Step‑by‑Step SOP (Deployment)</h2>
+          <details open>
+            <summary>1. Prepare prerequisites</summary>
+            <ul>
+              <li>Obtain AWS Organizations OrgId and confirm 17 target regions are enabled.</li>
+              <li>Confirm Control Tower / StackSet permissions and roles (if using Control Tower).</li>
+            </ul>
+          </details>
 
-  SentinelEventBusPolicy:
-    Type: AWS::Events::EventBusPolicy
-    DependsOn: SentinelEventBus
-    Properties:
-      StatementId: AllowOrgPutEvents
-      EventBusName: sentinel
-      Action: events:PutEvents
-      Principal: "*"
-      Condition:
-        Type: StringEquals
-        Key: aws:PrincipalOrgID
-        Value: !Ref PrincipalOrgID
+          <details>
+            <summary>2. Deploy Audit (StackSet) in Audit account</summary>
+            <ul>
+              <li>Deploy Firehose + CloudWatch Logs Destination StackSet to target regions.</li>
+              <li>Create central S3 bucket in primary region (example: us-east-1) with prefix <code>VPCflowLog/</code> and configure SQS + notification for suffix <code>.gz</code>.</li>
+            </ul>
+          </details>
 
-  ToolingFlowLogLambdaRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "Tooling-FlowLogLambdaRole-${AWS::Region}"
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: AssumeMemberRoles
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - sts:AssumeRole
-                Resource: '*'
+          <details>
+            <summary>3. Deploy Tooling CFT to Tooling account</summary>
+            <ul>
+              <li>Replace <code>PrincipalOrgID</code> with your Org ID in template.</li>
+              <li>Deploy in regions you want the tooling Lambda to run.</li>
+            </ul>
+          </details>
 
-  SentinelVPCFlowLambda:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub "${LambdaNamePrefix}-${AWS::Region}"
-      Runtime: python3.11
-      Handler: index.lambda_handler
-      Timeout: 120
-      Role: !GetAtt ToolingFlowLogLambdaRole.Arn
-      Code:
-        ZipFile: |
-          import boto3, json
+          <details>
+            <summary>4. Deploy Member CFT to Member accounts</summary>
+            <ul>
+              <li>Provide <code>ToolingAccountId</code> and <code>AuditAccountId</code> parameters.</li>
+              <li>Confirm the <code>Sentinel-FlowLog-Manager-&lt;region&gt;</code> trust policy allows the tooling account to assume role.</li>
+            </ul>
+          </details>
 
-          def lambda_handler(event, context):
-              print('Event:', json.dumps(event))
-              # route by source
-              if event.get('source') == 'sentinel.vpc.discovery':
-                  return run_discovery(event)
-              return run_create_vpc(event)
+          <details>
+            <summary>5. Update Tooling Lambda & 6. Cleanup</summary>
+            <ul>
+              <li>Ensure the flow log <code>LogFormat</code> omits <code>${flow-log-status}</code>.</li>
+              <li>Run provided cleanup script to delete old flow logs (sample included below).</li>
+            </ul>
+          </details>
 
-          def assume(member, region):
-              arn = f"arn:aws:iam::{member}:role/Sentinel-FlowLog-Manager-{region}"
-              sts = boto3.client('sts')
-              creds = sts.assume_role(RoleArn=arn, RoleSessionName='SentinelSession')['Credentials']
-              return boto3.client('ec2', region_name=region,
-                                  aws_access_key_id=creds['AccessKeyId'],
-                                  aws_secret_access_key=creds['SecretAccessKey'],
-                                  aws_session_token=creds['SessionToken'])
+          <details>
+            <summary>7. Trigger manual discovery & 8. Validate</summary>
+            <ul>
+              <li>Use the multi-region trigger script to put-events into all regions.</li>
+              <li>Validate new logs appear in CloudWatch in members, S3 objects under prefix, SQS messages, and Sentinel ingestion metrics.</li>
+            </ul>
+          </details>
+        </section>
 
-          def attach(ec2, vpc_id, region, member):
-              role = f"arn:aws:iam::{member}:role/Sentinel-FlowLog-role-{region}"
-              resp = ec2.create_flow_logs(
-                  ResourceIds=[vpc_id],
-                  ResourceType='VPC',
-                  TrafficType='ALL',
-                  LogGroupName='Sentinel-VPCFlowLog-All',
-                  DeliverLogsPermissionArn=role,
-                  LogDestinationType='cloud-watch-logs',
-                  MaxAggregationInterval=60,
-                  LogFormat='${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action}'
-              )
-              print('CreateFlowLogs resp', resp)
+        <section class="card">
+          <h2>Operational & Troubleshooting Checklist</h2>
+          <ul>
+            <li>SQS 0 messages — check S3 notifications and queue policy <code>aws:SourceArn</code>.</li>
+            <li>S3 files but no data in Sentinel — inspect file contents for <code>NODATA</code> entries.</li>
+            <li>Firehose delivery failures — verify bucket policy & Firehose role (s3:PutObject, AbortMultipartUpload, GetBucketLocation).</li>
+            <li>Lambda AssumeRole failures — validate trust policy and IAM role ARNs.</li>
+            <li>CloudFormation stuck in ROLLBACK — use <code>continue-update-rollback</code> with resource skip and fix IAM/trust issues.</li>
+          </ul>
+        </section>
 
-          def run_create_vpc(event):
-              d = event.get('detail', {})
-              region = event.get('region')
-              member = d.get('userIdentity', {}).get('accountId')
-              vpc_id = d.get('responseElements', {}).get('vpc', {}).get('vpcId')
-              if not (member and vpc_id and region):
-                  print('missing fields', event)
-                  return
-              ec2 = assume(member, region)
-              attach(ec2, vpc_id, region, member)
+        <section class="card">
+          <h2>Automation Scripts (examples)</h2>
+          <details>
+            <summary>Multi-region manual trigger (bash)</summary>
+            <pre><code>TOOLING_ACCOUNT=&lt;TOOLAccountID&gt;
+REGIONS=(ap-south-1 eu-west-1 eu-central-1 ap-northeast-1 ap-southeast-1 us-east-1 us-west-2 af-south-1)
+for r in "${REGIONS[@]}"; do
+  aws events put-events --region "$r" --entries "[{\"Source\":\"sentinel.manual.trigger\",\"DetailType\":\"ManualTrigger\",\"Detail\":\"{}\",\"EventBusName\":\"arn:aws:events:${r}:${TOOLING_ACCOUNT}:event-bus/sentinel\"}]"
+done</code></pre>
+          </details>
 
-          def run_discovery(event):
-              region = event.get('region') or (event.get('detail') or {}).get('region')
-              member = event.get('account') or (event.get('detail') or {}).get('account')
-              if not (member and region):
-                  print('Missing discovery fields')
-                  return
-              ec2 = assume(member, region)
-              vpcs = ec2.describe_vpcs().get('Vpcs', [])
-              for v in vpcs:
-                  vid = v['VpcId']
-                  logs = ec2.describe_flow_logs(Filters=[{'Name':'resource-id','Values':[vid]}]).get('FlowLogs', [])
-                  sentinel_exists = False
-                  for fl in logs:
-                      traffic_ok = fl.get('TrafficType') == 'ALL'
-                      tagged_ok = any(t.get('Key')=='Project' and t.get('Value')=='Sentinel' for t in fl.get('Tags', []))
-                      if traffic_ok and tagged_ok:
-                          sentinel_exists = True
-                          break
-                  if sentinel_exists:
-                      continue
-                  attach(ec2, vid, region, member)
+          <details>
+            <summary>Flow Log cleanup (Python pseudo)</summary>
+            <pre><code>import boto3
+from botocore.exceptions import ClientError
 
-  EventInvokeLambdaRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "Sentinel-InvokeLambdaRole-${AWS::Region}"
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: events.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: AllowInvokeSentinelLambda
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource: !GetAtt SentinelVPCFlowLambda.Arn
+def delete_old_flowlogs(account_id, role_arn, region):
+    sts = boto3.client('sts')
+    # assume role and call EC2.describe_flow_logs, delete_flow_logs with tagged Project=Sentinel
+    # (Implementation: assume role via sts.assume_role then use ec2 client)
+    pass
+</code></pre>
+          </details>
+        </section>
 
-  SentinelDiscoveryRule:
-    Type: AWS::Events::Rule
-    Properties:
-      EventBusName: sentinel
-      Description: "Triggers Lambda on discovery events"
-      EventPattern:
-        source:
-          - sentinel.vpc.discovery
-      Targets:
-        - Id: Discovery
-          Arn: !GetAtt SentinelVPCFlowLambda.Arn
-          RoleArn: !GetAtt EventInvokeLambdaRole.Arn
-
-  SentinelCreateVpcRule:
-    Type: AWS::Events::Rule
-    Properties:
-      EventBusName: sentinel
-      Description: "Triggers Lambda on CreateVpc CloudTrail events"
-      EventPattern:
-        source:
-          - aws.ec2
-        detail-type:
-          - AWS API Call via CloudTrail
-        detail:
-          eventSource:
-            - ec2.amazonaws.com
-          eventName:
-            - CreateVpc
-      Targets:
-        - Id: CreateVpc
-          Arn: !GetAtt SentinelVPCFlowLambda.Arn
-          RoleArn: !GetAtt EventInvokeLambdaRole.Arn
-
-  ManualTriggerRule:
-    Type: AWS::Events::Rule
-    Properties:
-      EventBusName: sentinel
-      Description: "Manual trigger for forcing discovery"
-      EventPattern:
-        source:
-          - sentinel.manual.trigger
-      Targets:
-        - Id: Manual
-          Arn: !GetAtt SentinelVPCFlowLambda.Arn
-          RoleArn: !GetAtt EventInvokeLambdaRole.Arn
-
-Outputs:
-  SentinelBusArn:
-    Value: !GetAtt SentinelEventBus.Arn
-  LambdaArn:
-    Value: !GetAtt SentinelVPCFlowLambda.Arn
-________________________________________
-4. Member Account - CloudFormation (YAML)
-Purpose: Creates CloudWatch Log Group, FlowLog role (deliver logs), Manager role (assumable by Tooling), SubscriptionFilter (to Audit), EventBridge cross-account rule forwarding discovery if required and a one-time Custom Resource to trigger discovery on create.
-AWSTemplateFormatVersion: '2010-09-09'
-Description: Member account resources for Sentinel
-Parameters:
-  ToolingAccountId:
-    Type: String
-    Default: "<TOOLAccountID>"
-  AuditAccountId:
-    Type: String
-    Default: "<AuditAccountID>"
-  DestinationName:
-    Type: String
-    Default: SentinelFlowLogs
-
-Resources:
-  SentinelVPCFlowLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: "Sentinel-VPCFlowLog-All"
-      RetentionInDays: 7
-      Tags:
-        - Key: Project
-          Value: Sentinel
-
-  SentinelFlowLogRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "Sentinel-FlowLog-role-${AWS::Region}"
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - vpc-flow-logs.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: FlowLogRolePolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:DescribeLogGroups
-                  - logs:DescribeLogStreams
-                  - logs:PutLogEvents
-                Resource: '*'
-
-  SentinelFlowLogManagerRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "Sentinel-FlowLog-Manager-${AWS::Region}"
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              AWS:
-                - !Sub "arn:aws:iam::${ToolingAccountId}:root"
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: FlowLogManagerPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - ec2:CreateFlowLogs
-                  - ec2:DescribeFlowLogs
-                  - ec2:DescribeVpcs
-                  - ec2:CreateTags
-                Resource: '*'
-
-  SentinelSubscriptionAttachRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "Sentinel-SubscriptionAttachRole-${AWS::Region}"
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - logs.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: SubscriptionAttachPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - logs:PutSubscriptionFilter
-                  - logs:DeleteSubscriptionFilter
-                  - logs:DescribeLogGroups
-                Resource: '*'
-
-  SentinelSubscriptionFilter:
-    Type: AWS::Logs::SubscriptionFilter
-    DependsOn: SentinelVPCFlowLogGroup
-    Properties:
-      LogGroupName: !Ref SentinelVPCFlowLogGroup
-      FilterPattern: "- \"NODATA\""
-      FilterName: !Sub "Sentinel-FlowLogs-${AWS::Region}"
-      DestinationArn: !Sub "arn:aws:logs:${AWS::Region}:${AuditAccountId}:destination:${DestinationName}"
-      RoleArn: !GetAtt SentinelSubscriptionAttachRole.Arn
-
-Outputs:
-  FlowLogRoleArn:
-    Value: !Sub "arn:aws:iam::${AWS::AccountId}:role/Sentinel-FlowLog-role-${AWS::Region}"
-  ManagerRoleArn:
-    Value: !GetAtt SentinelFlowLogManagerRole.Arn
-________________________________________
-5. Audit (Sentinel/Audit) Account - Firehose + CloudWatch Destination StackSet (YAML)
-Purpose: Create Firehose delivery stream, Firehose role, CloudWatch Logs Destination, and Destination policy to allow Org to PutSubscriptionFilter.
-AWSTemplateFormatVersion: '2010-09-09'
-Description: Sentinel Firehose + CloudWatch Logs Destination (StackSet)
-Parameters:
-  StackSetName:
-    Type: String
-  S3BucketAllEvents:
-    Type: String
-  S3Prefix:
-    Type: String
-    Default: "VPCflowLog/"
-  OrgId:
-    Type: String
-  SentinelDestinationName:
-    Type: String
-    Default: SentinelFlowLogsToFirehose
-  FirehoseDeliveryStreamNamePrefix:
-    Type: String
-    Default: firehose-sentinel
-Resources:
-  SentinelFirehoseStreamRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "${FirehoseDeliveryStreamNamePrefix}-role-${AWS::Region}-${StackSetName}"
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: firehose.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: !Sub "${FirehoseDeliveryStreamNamePrefix}-s3policy-${AWS::Region}"
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: AllowS3Write
-                Effect: Allow
-                Action:
-                  - s3:AbortMultipartUpload
-                  - s3:GetBucketLocation
-                  - s3:GetObject
-                  - s3:ListBucket
-                  - s3:ListBucketMultipartUploads
-                  - s3:PutObject
-                Resource:
-                  - !Sub arn:aws:s3:::${S3BucketAllEvents}
-                  - !Sub arn:aws:s3:::${S3BucketAllEvents}/*
-
-  FirehoseLogsDeliveryStream:
-    Type: AWS::KinesisFirehose::DeliveryStream
-    DependsOn:
-      - SentinelFirehoseStreamRole
-    Properties:
-      DeliveryStreamName: !Sub "${FirehoseDeliveryStreamNamePrefix}-${StackSetName}-${AWS::Region}"
-      DeliveryStreamType: DirectPut
-      ExtendedS3DestinationConfiguration:
-        BucketARN: !Sub arn:aws:s3:::${S3BucketAllEvents}
-        RoleARN: !GetAtt SentinelFirehoseStreamRole.Arn
-        Prefix: !Ref S3Prefix
-        ErrorOutputPrefix: !Sub "${S3Prefix}error/"
-        BufferingHints:
-          IntervalInSeconds: 300
-          SizeInMBs: 128
-        CompressionFormat: GZIP
-        EncryptionConfiguration:
-          NoEncryptionConfig: NoEncryption
-        CloudWatchLoggingOptions:
-          Enabled: true
-          LogGroupName: !Sub "/aws/kinesisfirehose/${StackSetName}"
-          LogStreamName: !Sub "FirehoseDelivery-${AWS::Region}"
-
-  CWSentinelToFirehoseRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "CWLogsToFirehoseRole-${StackSetName}-${AWS::Region}"
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: logs.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: !Sub "CWLogsToFirehosePolicy-${StackSetName}-${AWS::Region}"
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: AllowFirehoseReadsAndPut
-                Effect: Allow
-                Action:
-                  - firehose:DescribeDeliveryStream
-                  - firehose:PutRecord
-                  - firehose:PutRecordBatch
-                Resource: !GetAtt FirehoseLogsDeliveryStream.Arn
-
-  CloudWatchLogsDestination:
-    Type: AWS::Logs::Destination
-    DependsOn:
-      - FirehoseLogsDeliveryStream
-      - CWSentinelToFirehoseRole
-    Properties:
-      DestinationName: !Ref SentinelDestinationName
-      TargetArn: !GetAtt FirehoseLogsDeliveryStream.Arn
-      RoleArn: !GetAtt CWSentinelToFirehoseRole.Arn
-      DestinationPolicy: !Sub |
-        {
-          "Version":"2012-10-17",
-          "Statement":[
-            {
-              "Sid":"AllowOrgPutSubscriptionFilter",
-              "Effect":"Allow",
-              "Principal":"*",
-              "Action":"logs:PutSubscriptionFilter",
-              "Resource":"arn:aws:logs:${AWS::Region}:${AWS::AccountId}:destination:${SentinelDestinationName}",
-              "Condition":{
-                "StringEquals":{"aws:PrincipalOrgID":"${OrgId}"}
-              }
-            }
-          ]
-        }
-________________________________________
-6. SQS Queue Policy 
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "AllowS3SendMessage",
-      "Effect": "Allow",
-      "Principal": { "Service": "s3.amazonaws.com" },
-      "Action": "sqs:SendMessage",
-      "Resource": "arn:aws:sqs:<REGION>:<ACCOUNT-ID>:<QUEUE>",
-      "Condition": {
-        "ArnEquals": { "aws:SourceArn": "arn:aws:s3:::<BUCKET>" },
-        "StringEquals": { "aws:SourceAccount": "<BUCKET_ACCOUNT_ID>" }
-      }
-    },
-    {
-      "Sid": "AllowSentinelRead",
-      "Effect": "Allow",
-      "Principal": { "AWS": "<SENTINEL_ROLE_ARN>" },
-      "Action": [
-        "sqs:ReceiveMessage",
-        "sqs:DeleteMessage",
-        "sqs:GetQueueAttributes",
-        "sqs:GetQueueUrl"
-      ],
-      "Resource": "arn:aws:sqs:<REGION>:<ACCOUNT-ID>:<QUEUE>"
-    }
-  ]
-}
-________________________________________
-7. S3 Bucket Policy (bucket-owner-full-control enforcement example)
-{
+        <section class="card">
+          <h2>Bucket Policy (example enforcing bucket-owner-full-control)</h2>
+          <pre><code>{
   "Version": "2012-10-17",
   "Statement": [
     {
@@ -560,55 +198,197 @@ ________________________________________
     }
   ]
 }
-________________________________________
-8. Step‑by‑Step SOP (Deployment)
-1.	Prepare prerequisites
-o	Ensure AWS Organizations OrgId is available and region opt-ins (17 regions) are enabled in management account.
-o	Ensure Control Tower roles exist and StackSet can deploy to regions.
-2.	Deploy Audit (StackSet) in Audit account
-o	Deploy the Firehose + CloudWatch Logs Destination StackSet to all target regions.
-o	Create central S3 bucket (us-east-1) with prefix VPCflowLog/ and SQS queue plus notification for VPCflowLog/ + suffix .gz.
-3.	Deploy Tooling CFT to Tooling account
-o	Replace PrincipalOrgID with your Org ID.
-o	Deploy in each region where you want the tooling Lambda to run (or deploy once in the primary region and use cross-region invoke if desired).
-4.	Deploy Member CFT to each member account
-o	Provide ToolingAccountId and AuditAccountId.
-o	Confirm Sentinel-FlowLog-Manager-<region> role exists and trust allows Tooling account to assume.
-5.	Update Tooling Lambda
-o	Ensure LogFormat is included (no ${flow-log-status}) — to avoid NODATA.
-6.	Delete old FlowLogs
-o	Run cleanup script (I can provide) to delete existing flow logs across accounts/regions.
-7.	Trigger manual discovery
-o	Use provided script to put-events into all 17 regions — one event per region triggers tooling Lambda to recreate Flow Logs across 46 accounts.
-8.	Validate
-o	Check CloudWatch Logs in member accounts for new FlowLog entries (non-NODATA)
-o	Check Firehose monitoring, S3 objects landing under VPCflowLog/ prefix
-o	Check SQS queue receives messages
-o	Check Sentinel connector shows ingestion (green) and traffic counts > 0
-________________________________________
-9. Operational & Troubleshooting Checklist
-•	If SQS has 0 messages => check S3 notifications prefix/suffix and SQS queue policy aws:SourceArn.
-•	If S3 receives files but Sentinel shows no data => inspect file contents: NODATA vs real flow records.
-•	If Firehose cloudwatch shows delivery failures => check S3 bucket policy, ACL, and Firehose role permissions (s3:PutObject + s3:AbortMultipartUpload + s3:GetBucketLocation).
-•	If Lambda fails AssumeRole => check member Sentinel-FlowLog-Manager-<region> trust policy allows tooling account root or tooling role.
-•	If CloudFormation stuck in ROLLBACK => use continue-update-rollback with --resources-to-skip and fix underlying IAM/trust issues, then retry.
-________________________________________
-10. Automation Scripts (examples)
-Multi-region manual trigger (bash)
-TOOLING_ACCOUNT=<TOOLAccountID>
-REGIONS=(ap-south-1 eu-west-1 eu-central-1 ap-northeast-1 ap-southeast-1 us-east-1 us-west-2 af-south-1 ...)
-for r in "${REGIONS[@]}"; do
-  aws events put-events --region "$r" --entries "[{\"Source\":\"sentinel.manual.trigger\",\"DetailType\":\"ManualTrigger\",\"Detail\":\"{}\",\"EventBusName\":\"arn:aws:events:${r}:${TOOLING_ACCOUNT}:event-bus/sentinel\"}]"
-done
-Flow Log cleanup (python pseudo)
-•	Use boto3 sts to assume member Sentinel-FlowLog-Manager-<region> and call describe_flow_logs, delete_flow_logs for old tagged Project=Sentinel flow logs.
-________________________________________
-11. Best practices & Recommendations
-•	Use static prefix VPCflowLog/!{timestamp:yyyy}/... in Firehose to avoid yearly reconfiguration.
-•	Use FilterPattern: - "NODATA" on SubscriptionFilter to avoid NODATA traffic.
-•	Tag resources (Project=Sentinel) consistently for cleanup and ownership.
-•	Monitor Firehose delivery metrics and S3 Object count to detect anomalies.
-•	Store minimal retention and lifecycle rules in S3 (transition to Glacier/Expunge older than X days) to control costs.
-________________________________________
-If you want, I can: - Produce the full runnable CloudFormation files for each account/region packaged as downloadable files, or - Generate a more formal PDF SOP or a presentation slide deck for stakeholder review.
-Which would you like next?
+</code></pre>
+        </section>
+
+        <section class="card">
+          <h2>Ready-to-paste CloudFormation Templates (skeletons)</h2>
+          <p class="small">Copy the YAML blocks below into files and replace parameter placeholders before uploading to CloudFormation / StackSet.</p>
+
+          <details>
+            <summary>Tooling Account (tooling-cft.yaml)</summary>
+            <pre><code>AWSTemplateFormatVersion: '2010-09-09'
+Description: Sentinel Tooling Stack — EventBus, Lambda (SentinelVPCFlowLambda), Roles
+Parameters:
+  ToolingAccountId:
+    Type: String
+  PrincipalOrgID:
+    Type: String
+Resources:
+  SentinelEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: sentinel
+  SentinelLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  SentinelVPCFlowLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.11
+      Role: !GetAtt SentinelLambdaRole.Arn
+      Timeout: 120
+      Environment:
+        Variables:
+          TOOLING_ACCOUNT: !Ref ToolingAccountId
+</code></pre>
+          </details>
+
+          <details>
+            <summary>Member Account (member-cft.yaml)</summary>
+            <pre><code>AWSTemplateFormatVersion: '2010-09-09'
+Description: Sentinel Member Stack — Log Group, DeliverLogs Role, Manager Role, Subscription Filter
+Parameters:
+  ToolingAccountId:
+    Type: String
+  AuditAccountId:
+    Type: String
+Resources:
+  SentinelVPCFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: Sentinel-VPCFlowLog-All
+      RetentionInDays: 90
+  SentinelFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: flowlogs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeliverLogs
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: '*'
+  SentinelFlowLogManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${ToolingAccountId}:root
+            Action: sts:AssumeRole
+</code></pre>
+          </details>
+
+          <details>
+            <summary>Audit Account (audit-cft.yaml)</summary>
+            <pre><code>AWSTemplateFormatVersion: '2010-09-09'
+Description: Sentinel Audit Stack — CloudWatch Logs Destination + Firehose + S3
+Parameters:
+  CentralS3Bucket:
+    Type: String
+Resources:
+  SentinelFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseS3
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                Resource: !Sub arn:aws:s3:::${CentralS3Bucket}/*
+  SentinelFirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub arn:aws:s3:::${CentralS3Bucket}
+        RoleARN: !GetAtt SentinelFirehoseRole.Arn
+</code></pre>
+          </details>
+        </section>
+
+        <section class="card">
+          <h2>Validation Checks</h2>
+          <ul>
+            <li>CloudWatch LogGroup exists and receives flow records (non-NODATA).</li>
+            <li>SubscriptionFilter in member account exists and PutSubscriptionFilter succeeded (check CloudWatch Logs Destination policy).</li>
+            <li>Firehose metrics: DeliveryToS3.Success, Failed puts = 0.</li>
+            <li>S3 objects landing under <code>VPCflowLog/</code> with <code>.gz</code> suffix.</li>
+            <li>SQS receives notifications and Sentinel connector processes messages.</li>
+          </ul>
+        </section>
+
+        <section class="card">
+          <h2>Best practices & Recommendations</h2>
+          <ul>
+            <li>Use stable Firehose prefix <code>VPCflowLog/!{timestamp:yyyy}/</code> and lifecycle rules for cost control.</li>
+            <li>FilterPattern: <code>- "NODATA"</code> to avoid NODATA records.</li>
+            <li>Tag resources consistently (Project=Sentinel) for lifecycle and cleanup.</li>
+            <li>Monitor Firehose and S3 metrics; alert on sudden drops in object counts.</li>
+          </ul>
+        </section>
+
+      </main>
+
+      <aside>
+        <section class="card">
+          <h3>Quick Links</h3>
+          <p class="small">Use these sections to copy templates and scripts quickly into Git.</p>
+          <a class="download" href="#" onclick="downloadHTML();return false;">Download HTML</a>
+        </section>
+
+        <section class="card">
+          <h3>Checklist (short)</h3>
+          <ol>
+            <li>Create Audit stack & S3/SQS</li>
+            <li>Deploy Tooling stack</li>
+            <li>Deploy Member stacks</li>
+            <li>Run cleanup script</li>
+            <li>Trigger discovery</li>
+            <li>Validate ingestion</li>
+          </ol>
+        </section>
+
+        <section class="card">
+          <h3>Contact / Notes</h3>
+          <p class="small">Keep IAM role names stable: <code>Sentinel-FlowLog-role-&lt;region&gt;</code> and <code>Sentinel-FlowLog-Manager-&lt;region&gt;</code>. Use tags for ownership and cleanup.</p>
+        </section>
+      </aside>
+    </div>
+
+    <footer style="margin-top:18px;color:var(--muted);font-size:13px">Generated: Sentinel VPC Flow Log SOP — ready to save into your Git repository as <strong>sentinel-vpc-flowlogs-sop.html</strong></footer>
+  </div>
+
+  <script>
+    function downloadHTML(){
+      const blob = new Blob([document.documentElement.outerHTML],{type:'text/html'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'sentinel-vpc-flowlogs-sop.html';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+  </script>
+</body>
+</html>
