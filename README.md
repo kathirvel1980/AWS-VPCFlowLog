@@ -25,33 +25,34 @@ It includes:
 
 ```mermaid
 flowchart LR
-  subgraph MemberAccount[Member Account]
+  subgraph Member_Account["Member Account"]
     A[VPC]
-    B[CloudWatch Log Group\nSentinel-VPCFlowLog-All]
-    C[FlowLog Role\nSentinel-FlowLog-role-<region>]
-    A -->|Flow Logs -> CW Logs| B
-    B -->|SubscriptionFilter ->| D[CW Logs Destination (Audit account)]
-    B -->|EventRule: sentinel.vpc.discovery| E[EventBridge -> sentinel bus (Tooling)]
+    B["CloudWatch Log Group - Sentinel-VPCFlowLog-All"]
+    C["FlowLog Role - Sentinel-FlowLog-role-<region>"]
+    A -->|"Flow Logs → CloudWatch Logs"| B
+    B -->|"SubscriptionFilter → Audit Destination"| D
+    B -->|"Event Rule: sentinel.vpc.discovery"| E
   end
 
-  subgraph AuditAccount[Audit (Log Destination)]
-    D --> F[CloudWatch Logs Destination]
-    F --> G[Firehose Delivery Stream]
-    G --> H[S3 Bucket (us-east-1)]
-    H --> I[SQS Queue]
+  subgraph Audit_Account["Audit Account"]
+    D["CloudWatch Logs Destination"]
+    F["Firehose Delivery Stream"]
+    G["Central S3 Bucket (us-east-1)"]
+    H["SQS Queue"]
+    D --> F
+    F --> G
+    G --> H
   end
 
-  subgraph ToolingAccount[Tooling]
-    E --> J[Tooling EventBus: sentinel]
-    J --> K[SentinelVPCFlowLambda]
-    K -->|AssumeRole| L[Member: Sentinel-FlowLog-Manager-<region>]
-    K -->|create_flow_logs| B
+  subgraph Tooling_Account["Tooling Account"]
+    E --> J["EventBridge Bus: sentinel"]
+    J --> K["SentinelVPCFlowLambda"]
+    K -->|"AssumeRole"| L["Sentinel-FlowLog-Manager-<region>"]
+    K -->|"Create / Verify Flow Logs"| B
   end
 
-  I --> M[Azure Sentinel Connector]
-```
+  H --> M["Microsoft Sentinel Connector"]
 
----
 
 ## 🚀 High-Level Workflow
 
