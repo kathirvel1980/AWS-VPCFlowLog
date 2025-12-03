@@ -1,43 +1,231 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Sentinel Firehose + CloudWatch Logs Destination StackSet.
-  Deploy this in the Sentinel (audit) account across target regions.
+  Sentinel Audit Account – CloudWatch Logs Destination + Firehose + Transform Lambda (.log.gz classic flow logs).
 
 Parameters:
   StackSetName:
     Type: String
-    Description: Short name for resources (used in names)
+    Default: CF-SentinelAuditS3
+
   S3BucketAllEvents:
     Type: String
-    Description: S3 bucket name 
+    Default: sentinel-vpcflowlog-237509403034-us-east-1
+
   S3Prefix:
     Type: String
-    Description: S3 prefix 
     Default: "VPCFlowLog"
+
   OrgId:
     Type: String
-    Description: Organization ID (o-xxxxxxxxxx)
-    MinLength: 12
-    MaxLength: 12
     AllowedPattern: '^o-[a-z0-9]{10}$'
+    Default: o-xxxxxxxxxx
+
   SentinelDestinationName:
     Type: String
-    Description: CloudWatch Logs Destination name (per-region)
-    Default: SentinelFlowLogsToFirehose
+    Default: SentinelLogs
+
   FirehoseDeliveryStreamNamePrefix:
     Type: String
-    Description: Prefix for firehose delivery stream names
-    Default: Sentinel-vpc
+    Default: SentinelVPC
 
 Resources:
 
-  ########################################
-  # Firehose Role (writes to S3)
-  ########################################
+  ######################################################
+  # Lambda Execution Role (for TransformLambda)
+  # NOTE: principal is lambda.amazonaws.com only
+  ######################################################
+  TransformLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SentinelTransformExtraPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Allow Lambda to re-ingest into Firehose (PutRecordBatch) when needed
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecordBatch
+                Resource: "*"
+              # Allow CloudWatch logs put if Lambda logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+      Tags:
+        - Key: Project
+          Value: Sentinel
+  ######################################################
+  # FIXED Transform Lambda (Node.js 18 + @aws-sdk)
+  ######################################################
+  TransformLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "SentinelFirehose"
+      Description: "Classic VPC Flow Log Transfer to Sentinel S3"
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Timeout: 180
+      MemorySize: 512
+      Role: !GetAtt TransformLambdaRole.Arn
+      Code:
+        ZipFile: |
+          "use strict";
+       
+          const zlib = require("zlib");
+        
+          // Extended VPC Flow Logs format has 25 fields in your config
+          const EXPECTED_FIELD_COUNT = 25;
+        
+          // CSV header once per batch
+          const CSV_HEADERS = [
+          "version", "account-id", "interface-id", "srcaddr", "dstaddr", "srcport",
+          "dstport", "protocol", "packets", "bytes", "start", "end", "action",
+          "log-status", "vpc-id", "subnet-id", "instance-id", "tcp-flags", "type",
+          "pkt-srcaddr", "pkt-dstaddr", "region", "az-id", "sublocation-type", "sublocation-id"
+          ].join(" ");
+        
+          // Max transformed payload size per record (Firehose limit guard)
+          // Firehose hard limit is ~6 MB; we set a conservative guard here.
+          const MAX_PAYLOAD_BYTES = 5 * 1024 * 1024;
+        
+          exports.handler = async (event) => {
+          const results = [];
+          let headerAdded = false;
+          
+          try {
+              for (let i = 0; i < event.records.length; i++) {
+              const record = event.records[i];
+          
+              // Decode record.data (base64 -> maybe gzip -> string)
+              let decodedStr;
+              try {
+                  const compressed = Buffer.from(record.data, "base64");
+                  try {
+                  decodedStr = zlib.gunzipSync(compressed).toString("utf8");
+                  } catch {
+                  // Not gzipped; treat as plain UTF-8 string
+                  decodedStr = compressed.toString("utf8");
+                  }
+              } catch (e) {
+                  console.error("Base64/gzip decode failed:", e);
+                  results.push({ recordId: record.recordId, result: "Dropped" });
+                  continue;
+              }
+          
+              // Parse CloudWatch Logs subscription wrapper
+              let wrapper;
+              try {
+                  wrapper = JSON.parse(decodedStr);
+              } catch (e) {
+                  console.error("JSON parse failed:", e);
+                  results.push({ recordId: record.recordId, result: "Dropped" });
+                  continue;
+              }
+          
+              // Only process DATA_MESSAGE
+              const messageType = wrapper?.messageType;
+              if (messageType !== "DATA_MESSAGE") {
+                  // CONTROL_MESSAGE or other types: drop quietly
+                  results.push({ recordId: record.recordId, result: "Dropped" });
+                  continue;
+              }
+          
+              const logEvents = Array.isArray(wrapper?.logEvents) ? wrapper.logEvents : [];
+              if (logEvents.length === 0) {
+                  // No payload lines in this record—drop
+                  results.push({ recordId: record.recordId, result: "Dropped" });
+                  continue;
+              }
+          
+              // Build output: header (once) + transformed lines
+              const entries = [];
+              if (!headerAdded) {
+                  entries.push(CSV_HEADERS);
+                  headerAdded = true;
+              }
+          
+              for (const le of logEvents) {
+                  const raw = (le?.message || "").trim();
+                  if (!raw) continue;
+          
+                  // Skip NODATA lines
+                  // VPC Flow Logs "log-status" field can be NODATA; some lines may explicitly contain "NODATA"
+                  // We apply a simple contains check to avoid forwarding idle intervals.
+                  if (raw.includes("NODATA")) {
+                  continue;
+                  }
+          
+                  // Normalize whitespace, split on spaces, and validate field count
+                  const fields = raw.split(/\s+/);
+          
+                  if (fields.length !== EXPECTED_FIELD_COUNT) {
+                  // You can choose to forward anyway or drop. We drop to keep CSV aligned.
+                  // Log once for visibility, but avoid excessive logging in large streams.
+                  console.warn(`Dropping line with unexpected field count=${fields.length}: ${raw.slice(0, 200)}...`);
+                  continue;
+                  }
+          
+                  // Optional: additional guards/cleanups could go here (e.g., ensure numeric fields, timestamps, etc.)
+                  // For Sentinel ingestion, we typically keep the raw field order per extended format.
+          
+                  entries.push(fields.join(" "));
+              }
+          
+              // If nothing to emit (e.g., all lines were NODATA or malformed), drop the record
+              if (entries.length === (headerAdded ? 1 : 0)) {
+                  // Means we only added header but no entries, or no header and no entries
+                  results.push({ recordId: record.recordId, result: "Dropped" });
+                  continue;
+              }
+          
+              // Build payload; guard on size limits per record
+              const payloadStr = entries.join("\n") + "\n";
+              const payloadBuf = Buffer.from(payloadStr, "utf8");
+          
+              if (payloadBuf.byteLength > MAX_PAYLOAD_BYTES) {
+                  console.error(`Transformed payload exceeds size limit: ${payloadBuf.byteLength} bytes`);
+                  // You could chunk/partition here if needed. For now, mark as ProcessingFailed to trigger Firehose retry/DLQ.
+                  results.push({ recordId: record.recordId, result: "ProcessingFailed" });
+                  continue;
+              }
+          
+              const encoded = payloadBuf.toString("base64");
+              results.push({ recordId: record.recordId, result: "Ok", data: encoded });
+              }
+          
+              return { records: results };
+          } catch (e) {
+              // Fail-safe: if a batch-level unexpected error occurs, mark all records failed to let Firehose retry/DLQ.
+              console.error("Batch-level exception:", e);
+              for (const rec of event.records || []) {
+              results.push({ recordId: rec.recordId, result: "ProcessingFailed" });
+              }
+              return { records: results };
+          }
+          };
+      Tags:
+        - Key: Project
+          Value: Sentinel
+
+  ######################################################
+  # Firehose Role (writes to S3 AND invokes Lambda)
+  ######################################################
   SentinelFirehoseStreamRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${FirehoseDeliveryStreamNamePrefix}-role-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -45,91 +233,125 @@ Resources:
             Principal:
               Service: firehose.amazonaws.com
             Action: sts:AssumeRole
-      Path: /
       Policies:
-        - PolicyName: !Sub "${FirehoseDeliveryStreamNamePrefix}-s3policy-${AWS::Region}"
+        - PolicyName: FirehosePolicy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: AllowS3Write
-                Effect: Allow
+              - Effect: Allow
                 Action:
                   - s3:AbortMultipartUpload
                   - s3:GetBucketLocation
-                  - s3:GetObject
                   - s3:ListBucket
-                  - s3:ListBucketMultipartUploads
                   - s3:PutObject
+                  - s3:GetObject
                 Resource:
                   - !Sub arn:aws:s3:::${S3BucketAllEvents}
                   - !Sub arn:aws:s3:::${S3BucketAllEvents}/*
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunctionConfiguration
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TransformLambda.Arn
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/${FirehoseDeliveryStreamNamePrefix}-${AWS::Region}:*
       Tags:
         - Key: Project
           Value: Sentinel
-          
-  ########################################
-  # Firehose Delivery Stream (Extended S3)
-  ########################################
+
+  ######################################################
+  # Firehose CloudWatch Log Group / Stream
+  # NOTE: If a log group with same name already exists outside CFN, change name or delete existing.
+  ######################################################
+  FirehoseDeliveryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/kinesisfirehose/${FirehoseDeliveryStreamNamePrefix}-${AWS::Region}"
+      RetentionInDays: 7
+
+  FirehoseDeliveryLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseDeliveryLogGroup
+      LogStreamName: !Sub "FirehoseDelivery-${AWS::Region}"
+
+  ######################################################
+  # Firehose Delivery Stream
+  ######################################################
   FirehoseLogsDeliveryStream:
     Type: AWS::KinesisFirehose::DeliveryStream
-    DependsOn:
-      - SentinelFirehoseStreamRole
     Properties:
-      DeliveryStreamName: !Sub "${FirehoseDeliveryStreamNamePrefix}-${AWS::Region}"
       DeliveryStreamType: DirectPut
+      DeliveryStreamName: !Sub "${FirehoseDeliveryStreamNamePrefix}-${AWS::Region}"
+      
       ExtendedS3DestinationConfiguration:
-        BucketARN: !Sub arn:aws:s3:::${S3BucketAllEvents}
+        BucketARN: !Sub "arn:aws:s3:::${S3BucketAllEvents}"
         RoleARN: !GetAtt SentinelFirehoseStreamRole.Arn
-        Prefix: !Ref S3Prefix
-        ErrorOutputPrefix: !Sub "${S3Prefix}error/"
+        Prefix: !Sub "${S3Prefix}/"
         BufferingHints:
-          IntervalInSeconds: 300
           SizeInMBs: 128
+          IntervalInSeconds: 300
         CompressionFormat: GZIP
-        EncryptionConfiguration:
-          NoEncryptionConfig: NoEncryption
+        FileExtension: ".csv.gz"
         CloudWatchLoggingOptions:
           Enabled: true
-          LogGroupName: !Sub "/aws/kinesisfirehose/${StackSetName}"
-          LogStreamName: !Sub "FirehoseDelivery-${AWS::Region}"
+          LogGroupName: !Ref FirehoseDeliveryLogGroup
+          LogStreamName: !Ref FirehoseDeliveryLogStream
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt TransformLambda.Arn
+                - ParameterName: RoleArn
+                  ParameterValue: !GetAtt SentinelFirehoseStreamRole.Arn
+  
       Tags:
         - Key: Project
           Value: Sentinel
-          
-  ########################################
-  # Role that CloudWatch Logs will assume to put into Firehose
-  ########################################
+  ######################################################
+  # Lambda Invoke Permission - allow Firehose to invoke
+  ######################################################
+  TransformLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TransformLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: firehose.amazonaws.com
+      SourceArn: !GetAtt FirehoseLogsDeliveryStream.Arn
+  ######################################################
+  # CloudWatch Logs → Firehose Role (for Destination)
+  ######################################################
   CWSentinelToFirehoseRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "CWLogstoFirehoseRole-${AWS::Region}"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
-              Service: logs.amazonaws.com
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
             Action: sts:AssumeRole
-      Path: /
       Policies:
-        - PolicyName: !Sub "CWLogstoFirehoseRole-${AWS::Region}"
+        - PolicyName: LogDestinationToFirehose
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: AllowFirehoseReadsAndPut
-                Effect: Allow
+              - Effect: Allow
                 Action:
-                  - firehose:DescribeDeliveryStream
                   - firehose:PutRecord
                   - firehose:PutRecordBatch
                 Resource: !GetAtt FirehoseLogsDeliveryStream.Arn
       Tags:
         - Key: Project
           Value: Sentinel
-          
-  ########################################
-  # Destination Policy JSON doc is generated here
-  ########################################
+  ######################################################
+  # CloudWatch Logs Destination (cross-account)
+  ######################################################
   CloudWatchLogsDestination:
     Type: AWS::Logs::Destination
     DependsOn:
@@ -158,13 +380,10 @@ Resources:
 
 Outputs:
   FirehoseDeliveryStreamName:
-    Description: Firehose delivery stream name for this region
     Value: !Ref FirehoseLogsDeliveryStream
 
-  FirehoseDeliveryStreamArn:
-    Description: Firehose delivery stream ARN
-    Value: !GetAtt FirehoseLogsDeliveryStream.Arn
-
   CloudWatchDestinationArn:
-    Description: CloudWatch Destination ARN (use this in member accounts for PutSubscriptionFilter)
     Value: !GetAtt CloudWatchLogsDestination.Arn
+
+  TransformLambdaArn:
+    Value: !GetAtt TransformLambda.Arn
