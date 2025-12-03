@@ -12,28 +12,28 @@ Description: >
 Parameters:
   ToolingAccountId:
     Type: String
-    Default: "797049020986"
+    Default: ""
     Description: Account ID where Tooling Lambda runs (central automation)
+    AllowedPattern: '^[0-9]{12}$'
     MinLength: 12
     MaxLength: 12
-    AllowedPattern: '^[0-9]{12}$'
 
   AuditAccountId:
     Type: String
-    Default: "237509403034"
+    Default: ""
     Description: Audit Account ID hosting CloudWatch Logs Destination (firehose/other)
+    AllowedPattern: '^[0-9]{12}$'
     MinLength: 12
     MaxLength: 12
-    AllowedPattern: '^[0-9]{12}$'
 
   DestinationName:
     Type: String
     Default: SentinelLogs
     Description: CloudWatch Logs Destination name in Audit account
 
-  LambdaNamePrefix:
+  LambdaName:
     Type: String
-    Default: SentinelVPCflow
+    Default: SentinelVPCFlow
     Description: Prefix for the central Lambda functions
 
 Conditions:
@@ -159,6 +159,7 @@ Resources:
                   - ec2:DescribeFlowLogs
                   - ec2:DescribeVpcs
                   - ec2:CreateTags
+                  - ec2:DeleteFlowLogs
                 Resource: "*"
               - Effect: Allow
                 Action: iam:PassRole
@@ -192,11 +193,14 @@ Resources:
                 Action: events:PutEvents
                 Resource: !Sub "arn:aws:events:${AWS::Region}:${ToolingAccountId}:event-bus/sentinel"
 
+  ####################################################################
+  # DISCOVERY LAMBDA FUNCTION
+  ####################################################################
   DiscoveryInitFunction:
     Type: AWS::Lambda::Function
     DependsOn: DiscoveryInitRole
     Properties:
-      FunctionName: !Sub "Sentinel-DiscoveryInit-${AWS::Region}"
+      FunctionName: !Sub "SentinelFlowlog-${AWS::Region}"
       Handler: index.handler
       Runtime: python3.11
       Timeout: 60
