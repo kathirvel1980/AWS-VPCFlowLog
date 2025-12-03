@@ -23,35 +23,38 @@ It includes:
 
 ## 📐 Architecture Diagram (Mermaid)
 
-```mermaid
 flowchart LR
-  subgraph Member_Account["Member Account"]
+  subgraph Member_Account
     A[VPC]
-    B["CloudWatch Log Group - Sentinel-VPCFlowLog-All"]
-    C["FlowLog Role - Sentinel-FlowLog-role-<region>"]
-    A -->|"Flow Logs → CloudWatch Logs"| B
-    B -->|"SubscriptionFilter → Audit Destination"| D
-    B -->|"Event Rule: sentinel.vpc.discovery"| E
+    B[CloudWatch Log Group Sentinel-VPCFlowLog-All]
+    C[FlowLog Role Sentinel-FlowLog-role-region]
+    A --> B
+    B --> D
+    B --> E
   end
 
-  subgraph Audit_Account["Audit Account"]
-    D["CloudWatch Logs Destination"]
-    F["Firehose Delivery Stream"]
-    G["Central S3 Bucket (us-east-1)"]
-    H["SQS Queue"]
+  subgraph Audit_Account
+    D[CloudWatch Logs Destination]
+    F[Firehose Delivery Stream]
+    G[S3 Bucket]
+    H[SQS Queue]
     D --> F
     F --> G
     G --> H
   end
 
-  subgraph Tooling_Account["Tooling Account"]
-    E --> J["EventBridge Bus: sentinel"]
-    J --> K["SentinelVPCFlowLambda"]
-    K -->|"AssumeRole"| L["Sentinel-FlowLog-Manager-<region>"]
-    K -->|"Create / Verify Flow Logs"| B
+  subgraph Tooling_Account
+    E[Event to Tooling Bus]
+    J[EventBridge Bus sentinel]
+    K[SentinelVPCFlowLambda]
+    L[Manager Role region]
+    E --> J
+    J --> K
+    K --> L
+    K --> B
   end
 
-  H --> M["Microsoft Sentinel Connector"]
+  H --> M[Microsoft Sentinel]
 
 
 ## 🚀 High-Level Workflow
