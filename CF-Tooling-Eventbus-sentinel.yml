@@ -14,7 +14,7 @@ Parameters:
 
   PrincipalOrgID:
     Type: String
-    Default: o-xxxxxxxxxxx
+    Default: o-XXXXXXXXXXX
 
 Resources:
 
