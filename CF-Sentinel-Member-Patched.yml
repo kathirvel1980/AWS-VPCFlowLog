@@ -12,7 +12,7 @@ Description: >
 Parameters:
   ToolingAccountId:
     Type: String
-    Default: ""
+    Default: "123456789032"
     Description: Account ID where Tooling Lambda runs (central automation)
     AllowedPattern: '^[0-9]{12}$'
     MinLength: 12
@@ -20,7 +20,7 @@ Parameters:
 
   AuditAccountId:
     Type: String
-    Default: ""
+    Default: "123456789012"
     Description: Audit Account ID hosting CloudWatch Logs Destination (firehose/other)
     AllowedPattern: '^[0-9]{12}$'
     MinLength: 12
@@ -33,7 +33,7 @@ Parameters:
 
   LambdaName:
     Type: String
-    Default: SentinelVPCFlow
+    Default: SentinelTriggerVPC
     Description: Prefix for the central Lambda functions
 
 Conditions:
