@@ -20,7 +20,7 @@ Parameters:
 
   AuditAccountId:
     Type: String
-    Default: "123456789012"
+    Default: "123456789021"
     Description: Audit Account ID hosting CloudWatch Logs Destination (firehose/other)
     AllowedPattern: '^[0-9]{12}$'
     MinLength: 12
